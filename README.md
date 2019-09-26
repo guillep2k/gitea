@@ -1,5 +1,7 @@
 [简体中文](https://github.com/go-gitea/gitea/blob/master/README_ZH.md)
 
+# EDITADO
+
 # Gitea - Git with a cup of tea
 
 [![Build Status](https://drone.gitea.io/api/badges/go-gitea/gitea/status.svg)](https://drone.gitea.io/go-gitea/gitea)
