@@ -14,10 +14,15 @@ import (
 
 const (
 
+	// UserRepoUnitsLoggedInUser is a special user ID used in the UserRepoUnits table
+	// for permissions that apply to all logged in users when no specific record
+	// (userid + repoid) is present. It's intended for public repositories.
+	UserRepoUnitsLoggedInUser =		int64(-1)
+
 	// UserRepoUnitsAnyUser is a special user ID used in the UserRepoUnits table
 	// for permissions that apply to all users when no specific record
 	// (userid + repoid) is present. It's intended for public repositories.
-	UserRepoUnitsAnyUser =			int64(-1)
+	UserRepoUnitsAnyUser =			int64(-2)
 )
 
 // UserRepoUnits is an explosion (cartesian product) of all user permissions
@@ -343,17 +348,38 @@ func buildRepoUnits(e Engine, batchID int64, repo *Repository) error {
 
 		} else {
 
-			// ****************************************************************************
-			// Public repository for a visible user or organization
-			// ****************************************************************************
+			// ***********************************************************************************
+			// Public repository for a visible or limited user or organization (logged in users)
+			// ***********************************************************************************
 
-			// The special user "any user" gets at least read access to the repository
+			// Not explicit permissions are read-only
 			vals := strings.Repeat(fmt.Sprintf(",%d", AccessModeRead), len(cols))[1:]
+
+			// Logged in users get a record for themselves; this simplifies the queries for
+			// permission verification later.
+			// This covers organizations with Visibility == structs.VisibleTypeLimited
 			_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + cols +") " +
 							"VALUES (?, ?, ?, " + vals + ")",
-							batchID, UserRepoUnitsAnyUser, repo.ID)
+							batchID, UserRepoUnitsLoggedInUser, repo.ID)
 			if err != nil {
-				return fmt.Errorf("INSERT INTO user_repo_units_work (public): %v", err)
+				return fmt.Errorf("INSERT INTO user_repo_units_work (public, logged in): %v", err)
+			}
+
+			if repo.Owner.Visibility == structs.VisibleTypePublic {
+
+				// ****************************************************************************
+				// Public repository for a visible user or organization (anonymous users)
+				// ****************************************************************************
+
+				// Records for users that are not logged in.
+				// Whether the site requires all users to be logged in to access the data
+				// must be considered separately.
+				_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + cols +") " +
+								"VALUES (?, ?, ?, " + vals + ")",
+								batchID, UserRepoUnitsAnyUser, repo.ID)
+				if err != nil {
+					return fmt.Errorf("INSERT INTO user_repo_units_work (public, logged in): %v", err)
+				}
 			}
 		}
 	}
