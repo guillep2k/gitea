@@ -18,16 +18,6 @@ const (
 	// for permissions that apply to all users when no specific record
 	// (userid + repoid) is present. It's intended for public repositories.
 	UserRepoUnitsAnyUser =			int64(-1)
-
-	// UserRepoUnitsRepository is a special user ID used in the UserRepoUnits table
-	// to keep a snapshot of the currently enabled repository units.
-	UserRepoUnitsRepository =		int64(-2)
-
-	// How many repositories to load at a time in a batch
-	repoBatchSize =					100
-
-	// How many users to load at a time in a batch
-	userBatchSize =					100
 )
 
 // UserRepoUnits is an explosion (cartesian product) of all user permissions
@@ -36,12 +26,12 @@ const (
 // all users (e.g. UnitTypeCode:AccessModeRead) are set for UserID = UserRepoUnitsAnyUser
 // in order to reduce the number of records on the table. Special permissions on public
 // repos (e.g. writers, owners) are exploded to specific users accordingly.
-// This means that for checking whether a user has any given permission on a
+// This means that to check whether a user has any given permission on a
 // particular repository, both UserID == user's and UserID == UserRepoUnitsAnyUser must
-// be checked (the higher permission prevails).
+// be checked (the highest permission must prevail).
 
 // Except for the special user UserRepoUnitsAnyUser, only real users have records
-// in the table (i.e. organizations don't have their own record)
+// in the table (i.e. organizations don't have their own records)
 
 // If all permissions result in AccessModeNone, the record is omited, so joining
 // against this table will result in a quick check for whether the user can
@@ -63,24 +53,33 @@ const (
 type UserRepoUnits struct {
 	UserID      			 int64      	`xorm:"pk"`
 	RepoID      			 int64      	`xorm:"pk INDEX"`
-	UnitTypeCode           	 AccessMode		`xorm:"NOT NULL DEFAULT 0"`
-	UnitTypeIssues         	 AccessMode		`xorm:"NOT NULL DEFAULT 0"`
-	UnitTypePullRequests     AccessMode		`xorm:"NOT NULL DEFAULT 0"`
-	UnitTypeReleases         AccessMode		`xorm:"NOT NULL DEFAULT 0"`
-	UnitTypeWiki             AccessMode		`xorm:"NOT NULL DEFAULT 0"`
+	UnitTypeCode           	 AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+	UnitTypeIssues         	 AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+	UnitTypePullRequests     AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+	UnitTypeReleases         AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+	UnitTypeWiki             AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
 }
 
 // UserRepoUnitsWork is a table to temporarily accumulate all the work performed
 // while processing a batch. Ideally, this would be a temporary (no storage) table.
+// Records are grouped by BatchID in order to prevent any kind of collision.
 type UserRepoUnitsWork struct {
 	BatchID					 int64		 	`xorm:"NOT NULL INDEX"`
 	UserID      			 int64			`xorm:"NOT NULL"`
 	RepoID      			 int64			`xorm:"NOT NULL"`
-	UnitTypeCode           	 AccessMode		`xorm:"NOT NULL DEFAULT 0"`
-	UnitTypeIssues         	 AccessMode		`xorm:"NOT NULL DEFAULT 0"`
-	UnitTypePullRequests     AccessMode		`xorm:"NOT NULL DEFAULT 0"`
-	UnitTypeReleases         AccessMode		`xorm:"NOT NULL DEFAULT 0"`
-	UnitTypeWiki             AccessMode		`xorm:"NOT NULL DEFAULT 0"`
+	UnitTypeCode           	 AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+	UnitTypeIssues         	 AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+	UnitTypePullRequests     AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+	UnitTypeReleases         AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+	UnitTypeWiki             AccessMode		`xorm:"NOT NULL DEFAULT 0"`	// 0 = ModeAccessNone
+}
+
+// UserRepoUnitsBatchNumber provides unique ID values for the batch number
+// in a safe way in case we are in a multi-server environment.
+// It's a 63-bit number, so good luck reaching the maximum value
+// (300 million years at 1000 requests per second, if you want to know).
+type UserRepoUnitsBatchNumber struct {
+	ID      				 int64			`xorm:"pk autoincr"`
 }
 
 var (
@@ -93,129 +92,72 @@ var (
 	}
 
 	// Shorthands
-	userRepoUnitColumns string	// "unit_code, unit_issues, etc."
-	userRepoUnitMaxVal	string	// "max(unit_code), max(unit_issues), etc."
-	userRepoUnitArgs	string	// "?, ?, ?, ?, ?"
+	userRepoUnitColumns 	string	// "unit_code, unit_issues, etc."
+	userRepoUnitMaxVal		string	// "max(unit_code), max(unit_issues), etc."
+	userRepoUnitNotEmpty	string	// "unit_code <> AccessModeNone OR unit_issues <> AccessModeNone ..."
 )
 
-// UserRepoUnitsBatchType specifies the type of batch to process
-type UserRepoUnitsBatchType int
-
-const (
-	// UserRepoUnitsBatchOwner recalculate repository owner
-	// Any previous owner is deleted and the new owner is added
-	// Used for new repositories or for transferring ownership
-	UserRepoUnitsBatchOwner UserRepoUnitsBatchType = iota	// 0
-
-	// UserRepoUnitsBatchRepoTeam recalculate a team's access for an organization's repository
-	// Used when a repository is added/removed from a team
-	// It assumes the members list has not changed
-	UserRepoUnitsBatchRepoTeam								// 1
-
-	// UserRepoUnitsBatchRepoCollaborator recalculate collaborator access for repository
-	// Used when a user is added as collaborator, or their access level is modified
-	UserRepoUnitsBatchRepoCollaborator						// 2
-
-	// UserRepoUnitsBatchRepoUser recalculate a user access for a repository
-	// Used when other batch types wouldn't cover the change (e.g. user removed as collaborator)
-	UserRepoUnitsBatchRepoUser								// 3
-
-	// UserRepoUnitsBatchTeam recalculate a team's users access for all repositories
-	// Used when a team has changed access level (e.g. from reader to writer)
-	// It assumes the members list has not changed
-	UserRepoUnitsBatchTeam									// 4
-
-	// UserRepoUnitsBatchUser recalculate a user access for all repositories
-	// Used when other batch types wouldn't cover the change (e.g. user was disabled)
-	UserRepoUnitsBatchUser									// 5
-
-	// UserRepoUnitsBatchAnyUser recalculate user access for "any user" for repository
-	// Used when a repository changed it's visibility status (i.e. is_public)
-	UserRepoUnitsBatchAnyUser								// 6
-
-	// UserRepoUnitsBatchUnits recalculate units for repository (issues, prs, wiki, etc.)
-	// Used when a repository added or removed some unit (e.g. wiki)
-	UserRepoUnitsBatchUnits 								// 7
-)
-
-// UserRepoUnitsBatch is a batch of changes to be processed into UserRepoUnits.
-type UserRepoUnitsBatch struct {
-	ID              int64       `xorm:"pk autoincr"`
-
-	BatchType		UserRepoUnitsBatchType
-	RepoID			int64
-	UserID			int64
-	TeamID			int64
-	CollaboratorID	int64
-	FromScratch		bool		// No need to check for outdated entries if true
+func init() {
+	var cols, maxs, notempty []string
+	for _, col := range unit2Column {
+		cols = append(cols, col)
+		maxs = append(maxs, fmt.Sprintf("MAX(%s)", col))
+		notempty = append(notempty, fmt.Sprintf("%s <> %d", col, AccessModeNone))
+	}
+	userRepoUnitColumns = strings.Join(cols, ",")
+	userRepoUnitMaxVal = strings.Join(maxs, ",")
+	userRepoUnitNotEmpty = "(" + strings.Join(notempty, " OR ") + ")"
 }
 
-// RebuildAllRepoUnits will trigger a batch of rebuild for all repositories.
-func RebuildAllRepoUnits() error {
+// RebuildAllRemainingRepoUnits will build data for at most maxCount repositories 
+func RebuildAllRemainingRepoUnits(maxCount int) (int, error) {
 
+	// Use a single transaction for all the updates
 	sess := x.NewSession()
 	defer sess.Close()
 	if err := sess.Begin(); err != nil {
-		return err
+		return 0, err
 	}
 
-	// Remove any pending batches, since all repositories will be processed again
-	if _, err := sess.Exec("DELETE FROM user_repo_units"); err != nil {
-		return fmt.Errorf("DELETE user_repo_units: %v", err)
+	// Since site admins will always have at least code access to all repositories,
+	// we can be certain that any repo missing from user_repo_units is unprocessed.
+	q := sess.Table("repository").
+			  Select("id").
+			  Where("NOT EXISTS (SELECT 1 FROM user_repo_units WHERE user_repo_units = repository.id)")
+	
+	if maxCount > 0 {
+		q.Limit(maxCount, 0)
 	}
 
-	var (
-		maxRepoID, maxUserID	int64	
-	)
+	var repoIDs []int64
 
-	// Get last values for repository and user; we will recalculate in batches
-	// on a per-user basis (because teams are more efficiently checked this way)
-	if _, err := sess.Table("repository").Select("MAX(`id`)").Get(&maxRepoID); err != nil {
-		return fmt.Errorf("Finding MAX(RepoID): %v", err)
+	if _, err := q.Get(&repoIDs); err != nil {
+		return 0, err
 	}
 
-	if _, err := sess.Table("`user`").Select("MAX(`id`)").Get(&maxUserID); err != nil {
-		return fmt.Errorf("Finding MAX(UserID): %v", err)
+	if len(repoIDs) == 0 {
+		return 0, nil
 	}
 
-	for repoStart := int64(1) ; repoStart <= maxRepoID ; repoStart += repoBatchSize {
-		for userStart := int64(1) ; userStart <= maxUserID ; userStart += repoBatchSize {
+	processed := 0
 
+	for _, repoID := range repoIDs {
+		if err := RebuildRepoUnits(sess, repoID); err != nil {
+			return 0, err
 		}
+		processed++
 	}
 
-	return sess.Commit()
+	if err := sess.Commit(); err != nil {
+		return 0, err
+	}
+
+	return processed, nil
 }
 
-func rebuildRepoUnitsBatch(e Engine) error {
-	// The fastest would be a TRUNCATE TABLE, but that is DML and would execute
-	// outside any transaction, breaking readers.
-	if _, err := e.Exec("DELETE FROM user_repo_units"); err != nil {
-		return fmt.Errorf("DELETE user_repo_units: %v", err)
-	}
-
-	var (
-		maxRepoID, maxUserID	int64	
-	)
-
-	// Get last values for repository and user; we will 
-	if _, err := e.Table("repository").Select("MAX(`id`)").Get(&maxRepoID); err != nil {
-		return fmt.Errorf("Finding MAX(RepoID): %v", err)
-	}
-
-	if _, err := e.Table("`user`").Select("MAX(`id`)").Get(&maxUserID); err != nil {
-		return fmt.Errorf("Finding MAX(UserID): %v", err)
-	}
-
-	for repoStart := int64(1) ; repoStart <= maxRepoID ; repoStart += repoBatchSize {
-
-	}
-
-	return nil
-}
-
-// rebuildRepoUnits will rebuild all permissions to a given repository for all users 
-func rebuildRepoUnits(e Engine, batchID, repoID int64) error {
+// RebuildRepoUnits will rebuild all permissions to a given repository for all users 
+func RebuildRepoUnits(e Engine, repoID int64) error {
+	batchID, err := userRepoUnitsStartBatch(e)
 
 	repo, err := getRepositoryByID(e, repoID)
 	if err != nil {
@@ -226,15 +168,25 @@ func rebuildRepoUnits(e Engine, batchID, repoID int64) error {
 		return fmt.Errorf("getUnits(%d): %v", repoID, err)
 	}
 
-	// Start from scratch
+	// Make sure we start from scratch
 	_, err = e.Delete(&UserRepoUnits{RepoID: repoID})
 	if err != nil {
 		return fmt.Errorf("DELETE user_repo_units (repoID: %d): %v", repoID, err)
 	}
 
-	// Build a list units enabled on the repository
-	// UnitTypeCode should always be enabled on a repository, so we assume it is.
-	// Build a list columns that correspond to the units enabled on the repository
+	if err = buildRepoUnits(e, batchID, repo); err != nil {
+		return err
+	}
+
+	return userRepoUnitsFinishBatch(e, batchID)
+}
+
+// buildRepoUnits will build all permissions to a given repository for all users 
+func buildRepoUnits(e Engine, batchID int64, repo *Repository) error {
+
+	// Make a list of columns that correspond to the units enabled on the repository
+	// UnitTypeCode should always be enabled on a repository, so we assume it is
+	// to avoid adding extra checks in the code.
 	slcols := make([]string, 1, len(unit2Column)+1)
 	slunits := make([]UnitType, 1, len(unit2Column)+1)
 	slcols[0] = unit2Column[UnitTypeCode]
@@ -248,31 +200,41 @@ func rebuildRepoUnits(e Engine, batchID, repoID int64) error {
 		}
 	}
 
-	// Columns to update (unit_code, unit_issues, ... etc)
+	// List of columns to update (unit_code, unit_issues, ... etc)
 	cols := strings.Join(slcols,",")[1:]
+
+	// ****************************************************************************
+	// Insert permissions for site admins
+	// ****************************************************************************
 
 	// Values for the columns (repeats 4, 4, 4 ... etc.)
 	vals := strings.Repeat(fmt.Sprintf(",%d", AccessModeAdmin), len(cols))[1:]
 
-	// Insert permissions for site admins
-	_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + cols +") " +
+	_, err := e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + cols +") " +
 					"SELECT ?, `user`.id, ?, " + vals + " " +
 					"FROM `user` " +
-					"WHERE `user`.is_admin = ? AND `user`.is_active = ? AND `user`.prohibit_login = ?",
-					batchID, repoID, true, true, false)
+					"WHERE `user`.is_admin = ? AND `user`.is_active = ? AND `user`.prohibit_login = ? " +
+					"AND `user`.is_organization = ?",
+					batchID, repo.ID, true, true, false, false)
 	if err != nil {
 		return fmt.Errorf("INSERT INTO user_repo_units_work FROM SELECT (admins): %v", err)
 	}
 
 	if err = repo.getOwner(e); err != nil {
 		log.Error("Error repository %d has no owner: %v", err)
-		// Since the repository has no owner, nobody else has permissions
-		return nil
+		// Since the repository has no owner, nobody besides the admins should have permissions
+		return batchConsolidateWorkData(e, batchID)
 	}
 
 	if repo.Owner.IsOrganization() {
-		// Insert permissions for the team members by unit type, one type at a time
+
+		// ****************************************************************************
+		// Insert permissions for the members of teams who have access to this repo
+		// ****************************************************************************
+
+		// Process one unit type at a time to simplify SQL code
 		for _, ut := range slunits {
+
 			// This query will cover all teams with includes_all_repositories = false
 			_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + unit2Column[ut] + ") " +
 							"SELECT ?, `user`.id, team_repo.repo_id, team.authorize " +
@@ -282,12 +244,13 @@ func rebuildRepoUnits(e Engine, batchID, repoID int64) error {
 							"INNER JOIN team_user ON team_user.team_id = team.id " +
 							"INNER JOIN `user` ON `user`.id = team_user.uid " +
 							"WHERE team_repo.repo_id = ? AND team_unit.type = ? AND team.includes_all_repositories = ? " +
-							"AND `user`.is_active = ? AND `user`.prohibit_login = ? " +
+							"AND `user`.is_active = ? AND `user`.prohibit_login = ? AND `user`.is_organization = ? " +
 							"AND team.org_id = ?",	// Sanity check, just in case
-							batchID, repoID, ut, false, true, false, repo.OwnerID)
+							batchID, repo.ID, ut, false, true, false, false, repo.OwnerID)
 			if err != nil {
 				return fmt.Errorf("INSERT INTO user_repo_units_work (teams, include_all = false): %v", err)
 			}
+
 			// This query will cover all teams with includes_all_repositories = true
 			_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + unit2Column[ut] + ") " +
 							"SELECT ?, `user`.id, ?, team.authorize " +
@@ -295,10 +258,10 @@ func rebuildRepoUnits(e Engine, batchID, repoID int64) error {
 							"INNER JOIN team_unit ON team_unit.team_id = team.id " +
 							"INNER JOIN team_user ON team_user.team_id = team.id " +
 							"INNER JOIN `user` ON `user`.id = team_user.uid " +
-							"WHERE team.org_id = ? "+
-							"AND team_unit.type = ? AND team.includes_all_repositories = ? " +
-							"AND `user`.is_active = ? AND `user`.prohibit_login = ?",
-							batchID, repoID, repo.OwnerID, ut, true, true, false)
+							"WHERE team.org_id = ? AND team.includes_all_repositories = ? " +
+							"AND team_unit.type = ? " +
+							"AND `user`.is_active = ? AND `user`.prohibit_login = ? AND `user`.is_organization = ?",
+							batchID, repo.ID, repo.OwnerID, true, ut, true, false, false)
 			if err != nil {
 				return fmt.Errorf("INSERT INTO user_repo_units_work (teams, include_all = true): %v", err)
 			}
@@ -306,33 +269,52 @@ func rebuildRepoUnits(e Engine, batchID, repoID int64) error {
 
 	} else if repo.Owner.IsActive && !repo.Owner.ProhibitLogin {
 
-		// Insert permissions for the owner
+		// ****************************************************************************
+		// Insert permissions for the owner (if not inhibited)
+		// ****************************************************************************
+
 		vals := strings.Repeat(fmt.Sprintf(",%d", AccessModeOwner), len(cols))[1:]
 		_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + cols +") " +
 						"VALUES (?, ?, ?, " + vals + ")",
-						batchID, repo.OwnerID, repoID)
+						batchID, repo.OwnerID, repo.ID)
 		if err != nil {
 			return fmt.Errorf("INSERT INTO user_repo_units_work (owner): %v", err)
 		}
 	}
 
+	// ****************************************************************************
 	// Insert permissions for collaborators
+	// ****************************************************************************
+
 	vals = strings.Repeat(",collaboration.mode", len(cols))[1:]
 	_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + cols + ") " +
 					"SELECT ?, `user`.id, collaboration.repo_id, " + vals + " " +
 					"FROM collaboration " +
 					"INNER JOIN `user` ON `user`.id = collaboration.user_id " +
 					"WHERE collaboration.repo_id = ? " +
-					"AND `user`.is_active = ? AND `user`.prohibit_login = ?",
-					batchID, repoID, true, false)
+					"AND `user`.is_active = ? AND `user`.prohibit_login = ? AND `user`.is_organization = ?",
+					batchID, repo.ID, true, false, false)
 	if err != nil {
 		return fmt.Errorf("INSERT INTO user_repo_units_work (collaboration): %v", err)
 	}
-
+	
 	if !repo.IsPrivate {
-		// Public repositories give read access for everybody, but visibility is subject to the owner's
+
+		// ****************************************************************************
+		// Process repositories not marked as 'private'
+		// ****************************************************************************
+
+		// Public repositories give read access for everybody, but actual visibility
+		// depends on whether the repository owner is visible as well.
+
 		if repo.Owner.Visibility == structs.VisibleTypePrivate {
+
 			if repo.Owner.IsOrganization() {
+
+				// ****************************************************************************
+				// Public repository for a hidden organization
+				// ****************************************************************************
+
 				// All members of the organization get at least read access to the repository
 				vals := strings.Repeat(fmt.Sprintf(",%d", AccessModeRead), len(cols))[1:]
 				_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + cols + ") " +
@@ -342,61 +324,75 @@ func rebuildRepoUnits(e Engine, batchID, repoID int64) error {
 								"  SELECT team_user.uid " +
 								"  FROM team_user " +
 								"  INNER JOIN team ON team.org_id = ?) " +
-								"AND `user`.is_active = ? AND `user`.prohibit_login = ?",
-								batchID, repoID, repo.OwnerID, true, false)
+								"AND `user`.is_active = ? AND `user`.prohibit_login = ? AND `user`.is_organization = ?",
+								batchID, repo.ID, repo.OwnerID, true, false, false)
 				if err != nil {
 					return fmt.Errorf("INSERT INTO user_repo_units_work (public to organization): %v", err)
 				}
+
 			} else {
+
+				// ****************************************************************************
+				// Public repository for a hidden user
+				// ****************************************************************************
+				
 				// Currently, only organizations can have visibility == "private",
-				// but we can support it for plain users as well here just by doing nothing
+				// but we can support that for plain users as well by simply doing nothing
 				// (which will prevent creating an "any user" permission for the repository).
 			}
+
 		} else {
+
+			// ****************************************************************************
+			// Public repository for a visible user or organization
+			// ****************************************************************************
+
 			// The special user "any user" gets at least read access to the repository
 			vals := strings.Repeat(fmt.Sprintf(",%d", AccessModeRead), len(cols))[1:]
 			_, err = e.Exec("INSERT INTO user_repo_units_work (batch_id, user_id, repo_id, " + cols +") " +
 							"VALUES (?, ?, ?, " + vals + ")",
-							batchID, UserRepoUnitsAnyUser, repoID)
+							batchID, UserRepoUnitsAnyUser, repo.ID)
 			if err != nil {
 				return fmt.Errorf("INSERT INTO user_repo_units_work (public): %v", err)
 			}
 		}
 	}
 
-	return nil
+	return batchConsolidateWorkData(e, batchID)
 }
 
-// batchConsolidateWorkData moves data from UserRepoUnitsWork into UserRepoUnits
-func batchConsolidateWorkData(e Engine, batchID int64, deleteOld bool) error {
-	// UserRepoUnitsWork may contain multiple records for any single user.
-	// For example if the user is both a site admin and the repository owner.
-	// This function will insert the best set of permissions for the user into UserRepoUnits.
-	if deleteOld {
-		// Remove any records in user_repo_units that will be replaced.
-		// An IN clause would be ideal, but it's not supported by SQLite3
-		if _, err := e.Exec("DELETE FROM user_repo_units WHERE EXISTS " +
-							"(SELECT 1 FROM user_repo_units_work WHERE " +
-							"user_repo_units_work.user_id = user_repo_units.user_id AND " +
-							"user_repo_units_work.repo_id = user_repo_units.repo_id AND " +
-							"user_repo_units_work.batch_id = ?)", batchID); err != nil {
-			return fmt.Errorf("batchConsolidateWorkData (DELETE): %v", err)
-		}
+// userRepoUnitsStartBatch will return a unique ID for the batch transaction
+func userRepoUnitsStartBatch(e Engine) (int64, error) {
+	var batchnum UserRepoUnitsBatchNumber
+	// e.Insert() will return a new ID for the batch that is unique even among
+	// concurrent transactions.
+	if _, err := e.Insert(batchnum); err != nil {
+		return 0, err
 	}
+	return batchnum.ID, nil
+}
 
-	// Shorthands
-	const userRepoUnitColumnsMax = "max(unit_code), max(unit_issues), max(unit_pull_requests), max(unit_releases), max(unit_wiki)"
+func userRepoUnitsFinishBatch(e Engine, batchID int64) error {
+	_, err := e.Delete(&UserRepoUnitsWork{BatchID: batchID})
+	if err != nil {
+		return err
+	}
+	_, err = e.Delete(&UserRepoUnitsBatchNumber{ID: batchID})
+	return err
+}
 
-	if _, err := e.Exec("INSERT INTO user_repo_units " +
-		"SELECT user_id, repo_id, " + userRepoUnitColumnsMax + " " +
-		"FROM user_repo_units_work WHERE batch_id = ?)", batchID); err != nil {
+func batchConsolidateWorkData(e Engine, batchID int64) error {
+	// UserRepoUnitsWork may contain multiple records for any single user,
+	// for example if the user is both a site admin and the repository owner.
+	// This function will combine all records into the best set of permissions for each user
+	// and insert them into UserRepoUnits.
+	// Empty permissions (where all units are AccessModeNone) are skipped, so users with
+	// no permissions get no record in UserRepoUnitsWork.
+	if _, err := e.Exec("INSERT INTO user_repo_units ( user_id, repo_id, " + userRepoUnitColumns + ") " +
+		"SELECT user_id, repo_id, " + userRepoUnitMaxVal + " " +
+		"FROM user_repo_units_work WHERE batch_id = ? AND " + userRepoUnitNotEmpty,
+		batchID); err != nil {
 		return fmt.Errorf("batchConsolidateWorkData (INSERT): %v", err)
 	}
-
-	return batchCleanupTempTable(e, batchID)
-}
-
-func batchCleanupTempTable(e Engine, batchID int64) error {
-	_, err := e.Delete(&UserRepoUnitsWork{BatchID: batchID})
-	return err
+	return nil
 }
