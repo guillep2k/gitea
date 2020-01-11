@@ -292,7 +292,7 @@ var migrations = []Migration{
 	NewMigration("Add block on rejected reviews branch protection", addBlockOnRejectedReviews),
 	// v118 -> v119
 	NewMigration("Add commit id and stale to reviews", addReviewCommitAndStale),
-	// v119 -> v120
+	// v120 -> v121
 	NewMigration("Add and populate the user_repo_unit table", addUserRepoUnit),
 }
 
