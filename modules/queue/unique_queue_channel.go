@@ -28,11 +28,12 @@ type ChannelUniqueQueueConfiguration ChannelQueueConfiguration
 // only guaranteed whilst the task is waiting in the queue.
 type ChannelUniqueQueue struct {
 	*WorkerPool
-	lock     sync.Mutex
-	table    map[Data]bool
-	exemplar interface{}
-	workers  int
-	name     string
+	lock       sync.Mutex
+	table      map[Data]bool
+	overlapped map[Data]int
+	exemplar   interface{}
+	workers    int
+	name       string
 }
 
 // NewChannelUniqueQueue create a memory channel queue
@@ -46,17 +47,35 @@ func NewChannelUniqueQueue(handle HandlerFunc, cfg, exemplar interface{}) (Queue
 		config.BatchLength = 1
 	}
 	queue := &ChannelUniqueQueue{
-		table:    map[Data]bool{},
-		exemplar: exemplar,
-		workers:  config.Workers,
-		name:     config.Name,
+		table:      map[Data]bool{},
+		overlapped: map[Data]int{},
+		exemplar:   exemplar,
+		workers:    config.Workers,
+		name:       config.Name,
 	}
 	queue.WorkerPool = NewWorkerPool(func(data ...Data) {
 		for _, datum := range data {
 			queue.lock.Lock()
 			delete(queue.table, datum)
+			count, _ := queue.overlapped[datum]
+			queue.overlapped[datum] = count + 1
 			queue.lock.Unlock()
-			handle(datum)
+			for {
+				handle(datum)
+				queue.lock.Lock()
+				delete(queue.table, datum)
+				count = queue.overlapped[datum]
+				if count == 1 {
+					delete(queue.table, datum)
+				} else {
+					count--
+					queue.overlapped[datum] = count
+				}
+				queue.lock.Unlock()
+				if count == 0 {
+					break
+				}
+			}
 		}
 	}, config.WorkerPoolConfiguration)
 
@@ -98,19 +117,28 @@ func (q *ChannelUniqueQueue) PushFunc(data Data, fn func() error) error {
 	if _, ok := q.table[data]; ok {
 		return ErrAlreadyInQueue
 	}
-	// FIXME: We probably need to implement some sort of limit here
-	// If the downstream queue blocks this table will grow without limit
-	q.table[data] = true
-	if fn != nil {
-		err := fn()
-		if err != nil {
-			delete(q.table, data)
-			return err
+	_, overlapped := q.overlapped[data]
+	if overlapped {
+		// A worker is already handling this datum; ask it to process it again later
+		// Note: count doesn't need to get higher than 2
+		q.overlapped[data] = 2
+	} else {
+		// FIXME: We probably need to implement some sort of limit here
+		// If the downstream queue blocks this table will grow without limit
+		q.table[data] = true
+		if fn != nil {
+			err := fn()
+			if err != nil {
+				delete(q.table, data)
+				return err
+			}
 		}
 	}
 	locked = false
 	q.lock.Unlock()
-	q.WorkerPool.Push(data)
+	if !overlapped {
+		q.WorkerPool.Push(data)
+	}
 	return nil
 }
 
@@ -118,6 +146,7 @@ func (q *ChannelUniqueQueue) PushFunc(data Data, fn func() error) error {
 func (q *ChannelUniqueQueue) Has(data Data) (bool, error) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
+	// TODO: overlapped should be accounted for (only if > 1)
 	_, has := q.table[data]
 	return has, nil
 }
