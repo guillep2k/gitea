@@ -59,11 +59,12 @@ func NewChannelUniqueQueue(handle HandlerFunc, cfg, exemplar interface{}) (Queue
 			delete(queue.table, datum)
 			count, _ := queue.overlapped[datum]
 			queue.overlapped[datum] = count + 1
+			delete(queue.table, datum)
+			// TODO: Some kind of defer cleanup here is in order in case handle() panics
 			queue.lock.Unlock()
 			for {
 				handle(datum)
 				queue.lock.Lock()
-				delete(queue.table, datum)
 				count = queue.overlapped[datum]
 				if count == 1 {
 					delete(queue.table, datum)
