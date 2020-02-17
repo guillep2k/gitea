@@ -1025,7 +1025,7 @@ func VerifyActiveEmailCode(code, email string) *EmailAddress {
 		data := com.ToStr(user.ID) + email + user.LowerName + user.Passwd + user.Rands
 
 		if base.VerifyTimeLimitCode(data, minutes, prefix) {
-			emailAddress := &EmailAddress{Email: email}
+			emailAddress := &EmailAddress{UID: user.ID, Email: email}
 			if has, _ := x.Get(emailAddress); has {
 				return emailAddress
 			}
@@ -1496,6 +1496,8 @@ func GetUserByEmailContext(ctx DBContext, email string) (*User, error) {
 		return nil, err
 	}
 	if has {
+		// FIXME: user might be inactive (i.e. address not verified)
+		// Also, user might have been denied access
 		return user, nil
 	}
 
@@ -1511,6 +1513,7 @@ func GetUserByEmailContext(ctx DBContext, email string) (*User, error) {
 
 	// Finally, if email address is the protected email address:
 	if strings.HasSuffix(email, fmt.Sprintf("@%s", setting.Service.NoReplyAddress)) {
+		// FIXME: this can be spoofed
 		username := strings.TrimSuffix(email, fmt.Sprintf("@%s", setting.Service.NoReplyAddress))
 		user := &User{LowerName: username}
 		has, err := ctx.e.Get(user)

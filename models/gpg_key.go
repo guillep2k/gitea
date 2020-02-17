@@ -279,7 +279,7 @@ func parseGPGKey(ownerID int64, e *openpgp.Entity) (*GPGKey, error) {
 	}
 
 	//Check emails
-	userEmails, err := GetEmailAddresses(ownerID)
+	userEmails, err := GetUserEmailAddresses(ownerID, true)
 	if err != nil {
 		return nil, err
 	}

@@ -25,11 +25,21 @@ type EmailAddress struct {
 	IsPrimary   bool `xorm:"-"`
 }
 
-// GetEmailAddresses returns all email addresses belongs to given user.
+// GetEmailAddresses returns all email addresses belongs to given user,
+// even those that are not activated (e.g. mail verified)
 func GetEmailAddresses(uid int64) ([]*EmailAddress, error) {
+	return GetUserEmailAddresses(uid, false)
+}
+
+// GetUserEmailAddresses returns email addresses belongs to given user;
+// it can filter out addresses that are not activated.
+func GetUserEmailAddresses(uid int64, activatedOnly bool) ([]*EmailAddress, error) {
 	emails := make([]*EmailAddress, 0, 5)
-	if err := x.
-		Where("uid=?", uid).
+	sess := x.Where("uid=?", uid)
+	if activatedOnly {
+		sess = sess.And("is_activated = ?", true)
+	}
+	if err := sess.
 		Find(&emails); err != nil {
 		return nil, err
 	}
@@ -39,25 +49,28 @@ func GetEmailAddresses(uid int64) ([]*EmailAddress, error) {
 		return nil, err
 	}
 
-	isPrimaryFound := false
-	for _, email := range emails {
-		if email.Email == u.Email {
-			isPrimaryFound = true
-			email.IsPrimary = true
-		} else {
-			email.IsPrimary = false
+	if u.IsActive || !activatedOnly {
+		isPrimaryFound := false
+		for _, email := range emails {
+			if email.Email == u.Email {
+				isPrimaryFound = true
+				email.IsPrimary = true
+			} else {
+				email.IsPrimary = false
+			}
+		}
+
+		// We always want the primary email address displayed, even if it's not in
+		// the email address table (yet).
+		if !isPrimaryFound {
+			emails = append(emails, &EmailAddress{
+				Email:       u.Email,
+				IsActivated: u.IsActive,
+				IsPrimary:   true,
+			})
 		}
 	}
 
-	// We always want the primary email address displayed, even if it's not in
-	// the email address table (yet).
-	if !isPrimaryFound {
-		emails = append(emails, &EmailAddress{
-			Email:       u.Email,
-			IsActivated: true,
-			IsPrimary:   true,
-		})
-	}
 	return emails, nil
 }
 
@@ -201,7 +214,7 @@ func MakeEmailPrimary(email *EmailAddress) error {
 	}
 
 	// Make sure the former primary email doesn't disappear.
-	formerPrimaryEmail := &EmailAddress{Email: user.Email}
+	formerPrimaryEmail := &EmailAddress{UID: user.ID, Email: user.Email}
 	has, err = x.Get(formerPrimaryEmail)
 	if err != nil {
 		return err
